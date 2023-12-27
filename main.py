@@ -1,4 +1,5 @@
 import asyncio
+import logging
 import os
 from io import BytesIO
 from xml.etree import ElementTree as ET
@@ -9,15 +10,19 @@ from PIL import Image
 
 
 class Manga:
-    main_url = "https://manga4life.com/manga"
     xml_url = "https://manga4life.com/rss"
-    html_url = "https://manga4life.com/read-online"
     image_url = "https://temp.compsci88.com/manga"
 
     def __init__(self, name: str) -> None:
         self.name = name
         self.uid = name.capitalize().replace(" ", "-")
         self.slug = name.lower().replace(" ", "_")
+
+        self.dir = os.path.join("data", self.slug)
+
+        logging.basicConfig(
+            filename=f"{self.slug}.log", encoding="utf-8", level=logging.DEBUG
+        )
 
     def find_last_chapter(self) -> int:
         url_to_fetch = f"{self.xml_url}/{self.uid}.xml"
@@ -38,59 +43,72 @@ class Manga:
 
         return int(last_chapter.split("-")[-1])
 
-    async def download_chapter(self, chapter: int, patience: int = 3, limit: int = 100):
-        dir_path = os.path.join("data", self.slug, str(chapter).zfill(4))
-        os.makedirs(dir_path, exist_ok=True)
-
-        page = 1
-        counter = 0
-        while page < limit and counter < patience:
-            try:
-                await self.download_page(chapter, page)
-
-            except aiohttp.ClientResponseError as e:
-                print(f"Error in chapter {chapter}, page {page}: {e}")
-                counter += 1
-
-            page += 1
-
     async def download_page(self, chapter: int, page: int):
         image_url = f"{self.image_url}/{self.uid}/{chapter:04}-{page:03}.png"
 
         async with aiohttp.ClientSession() as session:
             async with session.get(image_url) as response:
-                response.raise_for_status()
+                try:
+                    response.raise_for_status()
+
+                except aiohttp.ClientResponseError as e:
+                    logging.warning(f"Error in chapter {chapter}, page {page}: {e}")
+                    raise e
 
                 image = Image.open(BytesIO(await response.read()))
                 image.save(
-                    os.path.join(self.slug, str(chapter).zfill(4), f"{page:03}.png")
+                    os.path.join(self.dir, str(chapter).zfill(4), f"{page:03}.png")
                 )
 
+                logging.info(f"'{image_url}' downloaded successfully")
+
+    async def _download_pages_in_chunks(self, chapter, window_size):
+        page = 1
+        while True:
+            chunk = range(page, page + window_size)
+            yield [self.download_page(chapter, page) for page in chunk]
+            page += window_size
+
+    async def download_chapter(self, chapter: int, window: int = 5):
+        dir_path = os.path.join(self.dir, str(chapter).zfill(4))
+        os.makedirs(dir_path, exist_ok=True)
+
+        async for page_group in self._download_pages_in_chunks(chapter, window):
+            try:
+                await asyncio.gather(*page_group)
+            except aiohttp.ClientResponseError as e:
+                break
+
+    async def _download_chapters_in_chunks(self, chapters: range, window_size: int):
+        while chapters:
+            chunk = chapters[:window_size]
+            chapters = chapters[window_size:]
+
+            yield [self.download_chapter(chapter) for chapter in chunk]
+
     async def download_all_chapters(
-        self, start: int = 1, end: int = -1, limit: int = 100
+        self, begin: int = 1, end: int = -1, window: int = 10
     ):
         if end == -1:
             end = self.find_last_chapter()
 
-        tasks = [
-            asyncio.create_task(self.download_chapter(chapter, limit=limit))
-            for chapter in range(start, end + 1)
-        ]
+        chapters = range(begin, end + 1)
+        async for chapter_group in self._download_chapters_in_chunks(chapters, window):
+            await asyncio.gather(*chapter_group)
 
-        await asyncio.gather(*tasks)
+            logging.info(f"{len(chapter_group)} chapters downloaded")
+
+            logging.debug(f"sleeping for 30 seconds")
+
+            await asyncio.sleep(30)
 
 
 async def main():
-    m = Manga("vagabond")
-    await m.download_all_chapters()
+    m = Manga(name)
+    await m.download_all_chapters(45)
 
 
 if __name__ == "__main__":
+    name = "Vagabond"
+
     asyncio.run(main())
-
-
-# # Example usage:
-# base_url = "https://example.com/page/"  # Replace with the actual base URL
-# start_page = 1  # Adjust as needed
-# end_page = 5  # Adjust as needed
-# generate_pdf_from_url(base_url, start_page, end_page)
