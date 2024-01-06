@@ -1,27 +1,122 @@
 import asyncio
 import logging
 import os
+import re
 from io import BytesIO
 from xml.etree import ElementTree as ET
 
 import aiohttp
 import requests
 from PIL import Image
+from selenium.webdriver.chrome.webdriver import WebDriver
+from selenium.webdriver.common.by import By
 
 
 class Manga:
-    xml_url = "https://manga4life.com/rss"
-    # image_url = "https://temp.compsci88.com/manga"
-    image_url = "https://scans-hot.leanbox.us/manga"
+    main_url = "https://manga4life.com"
+    pattern = r".*(?:[0-9]{4}-[0-9]{3})\.png$"
 
     def __init__(self, name: str, path: str | None = None) -> None:
         self.name = name
-        self.uid = name.capitalize().replace(" ", "-")
+        self.uid = name.title().replace(" ", "-")
         self.slug = name.lower().replace(" ", "_")
 
         self.path = os.path.join(path or "data", self.slug)
 
         self.set_logger()
+
+    async def download_chapters(
+        self,
+        begin: int = 1,
+        end: int = -1,
+        concurrent_chapters: int = 3,
+        concurrent_downloads: int = 10,
+    ):
+        if end == -1:
+            end = self.find_last_chapter()
+
+        for chunk_start in range(begin, end + 1, concurrent_chapters):
+            chunk_end = min(chunk_start + concurrent_chapters - 1, end)
+
+            tasks = [
+                asyncio.create_task(
+                    self.run_driver_and_download(idx, concurrent_downloads)
+                )
+                for idx in range(chunk_start, chunk_end + 1)
+            ]
+            await asyncio.gather(*tasks)
+
+        self.logger.debug("done")
+
+    async def run_driver_and_download(self, idx: int, window_size: int):
+        images = await self.run_driver(idx)
+        await self.download_images(images, window_size)
+
+    async def run_driver(self, chapter: int) -> list[str]:
+        dir_path = os.path.join(self.path, str(chapter).zfill(4))
+        os.makedirs(dir_path, exist_ok=True)
+
+        driver = WebDriver()
+        driver.get(f"{self.main_url}/read-online/{self.uid}-chapter-{chapter}.html")
+
+        images = self.get_images_src(driver)
+
+        driver.quit()
+
+        if len(images) == 0:
+            logging.warning("No images were found")
+
+        return images
+
+    def get_images_src(self, driver: WebDriver) -> list[str]:
+        driver.implicitly_wait(10)
+        images = driver.find_elements(By.TAG_NAME, "img")
+        sources = [img.get_attribute("src") for img in images]
+
+        for i, source in enumerate(sources):
+            if source is None:
+                logging.warning(f"index {i} was None")
+
+        filtered_sources = [
+            str(source) for source in sources if re.match(self.pattern, str(source))
+        ]
+
+        return filtered_sources
+
+    async def download_images(self, images: list[str], window_size: int = 5):
+        semaphore = asyncio.Semaphore(window_size)
+
+        async def download_with_limit(url):
+            async with semaphore:
+                return await self.download_image(url)
+
+        tasks = [asyncio.create_task(download_with_limit(url)) for url in images]
+        await asyncio.gather(*tasks)
+
+    async def download_image(self, image_url: str):
+        chapter, page = self._extract_chapter_page(image_url)
+
+        async with aiohttp.ClientSession() as session:
+            async with session.get(image_url) as response:
+                try:
+                    response.raise_for_status()
+
+                except aiohttp.ClientResponseError as e:
+                    self.logger.error(f"Error in {image_url}: {e}")
+                    raise e
+
+                image = Image.open(BytesIO(await response.read()))
+                image.save(os.path.join(self.path, chapter, f"{page}.png"))
+
+                self.logger.info(f"'{image_url}' downloaded successfully")
+
+    @staticmethod
+    def _extract_chapter_page(url: str) -> tuple[str, str]:
+        info = url.split("/")[-1].split(".")[0]
+
+        chapter, page = info.split("-")
+
+        return chapter, page
 
     def set_logger(self):
         file_handler = logging.FileHandler(f"{self.slug}.log", encoding="utf-8")
@@ -31,10 +126,10 @@ class Manga:
         self.logger = logging.getLogger()
         self.logger.addHandler(file_handler)
 
-        self.logger.setLevel(logging.DEBUG)
+        self.logger.setLevel(logging.INFO)
 
     def find_last_chapter(self) -> int:
-        url_to_fetch = f"{self.xml_url}/{self.uid}.xml"
+        url_to_fetch = f"https://manga4life.com/rss/{self.uid}.xml"
 
         response = requests.get(url_to_fetch)
         response.raise_for_status()
@@ -52,74 +147,14 @@ class Manga:
 
         return int(last_chapter.split("-")[-1])
 
-    async def download_page(self, chapter: int, page: int):
-        image_url = f"{self.image_url}/{self.uid}/{chapter:04}-{page:03}.png"
-
-        async with aiohttp.ClientSession() as session:
-            async with session.get(image_url) as response:
-                try:
-                    response.raise_for_status()
-
-                except aiohttp.ClientResponseError as e:
-                    self.logger.warning(f"Error in chapter {chapter}, page {page}: {e}")
-                    raise e
-
-                image = Image.open(BytesIO(await response.read()))
-                image.save(
-                    os.path.join(self.path, str(chapter).zfill(4), f"{page:03}.png")
-                )
-
-                self.logger.info(f"'{image_url}' downloaded successfully")
-
-    async def _download_pages_in_chunks(self, chapter: int, window_size: int):
-        page = 1
-        while True:
-            chunk = range(page, page + window_size)
-            yield [self.download_page(chapter, page) for page in chunk]
-            page += window_size
-
-    async def download_chapter(self, chapter: int, window_size: int = 5):
-        dir_path = os.path.join(self.path, str(chapter).zfill(4))
-        os.makedirs(dir_path, exist_ok=True)
-
-        async for page_group in self._download_pages_in_chunks(chapter, window_size):
-            try:
-                await asyncio.gather(*page_group)
-            except aiohttp.ClientResponseError as e:
-                break
-
-    async def _download_chapters_in_chunks(self, chapters: range, window_size: int):
-        while chapters:
-            chunk = chapters[:window_size]
-            chapters = chapters[window_size:]
-
-            yield [self.download_chapter(chapter) for chapter in chunk]
-
-    async def download_chapters(
-        self, begin: int = 1, end: int = -1, window_size: int = 10
-    ):
-        if end == -1:
-            end = self.find_last_chapter()
-
-        chapters = range(begin, end + 1)
-        async for chapter_group in self._download_chapters_in_chunks(
-            chapters, window_size
-        ):
-            await asyncio.gather(*chapter_group)
-            self.logger.info(f"{len(chapter_group)} chapters downloaded")
-
-            self.logger.debug(f"sleeping for 300 seconds")
-            await asyncio.sleep(300)
-
-        self.logger.debug("done")
-
 
 async def main():
     m = Manga(name)
-    await m.download_chapters(165)
+
+    await m.download_chapters(1, 11)
 
 
 if __name__ == "__main__":
-    name = "Vagabond"
+    name = "chainsaw man color"
 
     asyncio.run(main())
